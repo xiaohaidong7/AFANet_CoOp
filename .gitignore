@@ -1,0 +1,11 @@
+*.pt
+*.pth
+vis_results/
+logs/pascal_resnet50_fold0_coop.log/tbd/
+logs/_TEST_pascal_resnet50_fold0_coop_1215_131225.log/tbd/
+
+.DS_Store
+.vscode/
+
+__pycache__/
+*.py[cod]
