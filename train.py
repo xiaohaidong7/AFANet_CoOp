@@ -143,7 +143,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=4e-4)
     parser.add_argument('--lr_prompt', type=float, default=2e-3, help='learning rate for prompt learner')
     parser.add_argument('--niter', type=int, default=50) 
-    parser.add_argument('--nworker', type=int, default=32)
+    parser.add_argument('--nworker', type=int, default=16)
     parser.add_argument('--fold', type=int, default=0, choices=[0, 1, 2, 3])
     parser.add_argument('--stage', type=int, default=2) 
     parser.add_argument('--backbone', type=str, default='resnet50', choices=['vgg16', 'resnet50', 'resnet101'])
@@ -202,8 +202,15 @@ if __name__ == '__main__':
             param.requires_grad = True
             decoder_params.append(param)
     
-    print(f"Num of Prompt Params: {len(prompt_params)}")
-    print(f"Num of Decoder Params: {len(decoder_params)}")
+    # 计算真实的参数元素总数 (numel = number of elements)
+    num_prompt_elements = sum(p.numel() for p in prompt_params)
+    num_decoder_elements = sum(p.numel() for p in decoder_params)
+
+    Logger.info(f"Num of Prompt Tensors: {len(prompt_params)}")
+    Logger.info(f"Num of Prompt Params (Elements): {num_prompt_elements}")
+
+    Logger.info(f"Num of Decoder Tensors: {len(decoder_params)}")
+    Logger.info(f"Num of Decoder Params (Elements): {num_decoder_elements}")
 
     optimizer = optim.Adam([
         {"params": prompt_params, "lr": args.lr_prompt},    # CoOp 推荐 LR，通常比主 LR 大 10-50 倍

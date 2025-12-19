@@ -195,5 +195,56 @@ def zeroshot_classifier(classnames, templates, model):
         zeroshot_weights = torch.stack(zeroshot_weights, dim=1)
     return zeroshot_weights.t()
 
+# 受CAM影响的可变形卷积========================================================================================================================
+class PlugAndPlayDCN(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, groups=1):
+        super(PlugAndPlayDCN, self).__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.groups = groups
+        
+        # 1. 核心卷积权重
+        self.weight = nn.Parameter(torch.empty(out_channels, in_channels // groups, kernel_size, kernel_size))
+        self.bias = nn.Parameter(torch.empty(out_channels))
+        
+        # 2. 预测 offset 和 mask
+        self.p_conv = nn.Conv2d(in_channels, 3 * kernel_size * kernel_size, 
+                                kernel_size=kernel_size, padding=padding, stride=stride)
+        
+        # 初始化
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.bias)
+        nn.init.zeros_(self.p_conv.weight)
+        nn.init.zeros_(self.p_conv.bias)
+
+    def forward(self, x, external_mask=None):
+        # x: [B, C, H, W]
+        # external_mask: [B, 1, H, W] (比如 CAM)
+        
+        # 1. 预测 Offset 和 内部 Mask
+        out = self.p_conv(x)
+        o1, o2, mask = torch.chunk(out, 3, dim=1)
+        offset = torch.cat([o1, o2], dim=1)
+        
+        # DCN 自身学到的 Mask (0~1)
+        mask = torch.sigmoid(mask)
+        
+        # === [关键修改] 注入 CAM 掩码 ===
+        if external_mask is not None:
+            # 确保 external_mask 和 x 的尺寸一致 (需要插值)
+            if external_mask.shape[-2:] != x.shape[-2:]:
+                external_mask = F.interpolate(external_mask, size=x.shape[-2:], 
+                                              mode='bilinear', align_corners=True)
+            
+            # 广播机制：[B, 1, H, W] * [B, 9, H, W] -> [B, 9, H, W]
+            # 逻辑：如果 CAM 说是背景(0)，那么无论 DCN 想看哪里，最终权重都被置为 0
+            mask = mask * external_mask 
+        # ==============================
+        
+        return deform_conv2d(x, offset, self.weight, self.bias, 
+                             stride=self.stride, padding=self.padding, 
+                             mask=mask)
+# ========================================================================================================================
 
 

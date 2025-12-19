@@ -1,52 +1,105 @@
 import pdb
 from functools import reduce
 from operator import add
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import resnet
 from torchvision.models import vgg
+from torchvision.ops import deform_conv2d
+import clip
+
+# 请确保这些模块在他的文件中存在，或者根据你的目录结构调整引用
 from .base.feature import extract_feat_vgg, extract_feat_res
 from .base.correlation import Correlation
 from .learner import HPNLearner
-from model.afa_module import Octave, NeighborConnectionDecoder, BasicConv2d
+from model.afa_module import NeighborConnectionDecoder, BasicConv2d # Octave 被 DCN 替代，不需要了
 from generate_cam_voc import PASCAL_CLASSES
 from generate_cam_coco import COCO_CLASSES
-import clip
 
-# ================= [新增] CoOp Prompt Learner 模块 =================
+# ==========================================================================================
+# 1. [新增] 支持外部 Mask 注入的可变形卷积 DCNv2
+# ==========================================================================================
+class PlugAndPlayDCN(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, groups=1):
+        super(PlugAndPlayDCN, self).__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.groups = groups
+        
+        # 核心卷积权重
+        self.weight = nn.Parameter(torch.empty(out_channels, in_channels // groups, kernel_size, kernel_size))
+        self.bias = nn.Parameter(torch.empty(out_channels))
+        
+        # 预测 offset 和 mask (眼睛)
+        self.p_conv = nn.Conv2d(in_channels, 3 * kernel_size * kernel_size, 
+                                kernel_size=kernel_size, padding=padding, stride=stride)
+        
+        # 初始化：确保初始状态接近普通卷积
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.bias)
+        nn.init.zeros_(self.p_conv.weight)
+        nn.init.zeros_(self.p_conv.bias)
+
+    def forward(self, x, external_mask=None):
+        # 1. 预测 Offset 和 内部 Mask
+        out = self.p_conv(x)
+        o1, o2, mask = torch.chunk(out, 3, dim=1)
+        offset = torch.cat([o1, o2], dim=1)
+        
+        # DCN 自身学到的 Mask (0~1)
+        mask = torch.sigmoid(mask)
+        
+        # 2. [关键] 注入 CAM 外部掩码
+        if external_mask is not None:
+            # 确保 external_mask 和 x 的尺寸一致 (插值对齐)
+            if external_mask.shape[-2:] != x.shape[-2:]:
+                external_mask = F.interpolate(external_mask, size=x.shape[-2:], 
+                                              mode='bilinear', align_corners=True)
+            
+            # 广播机制：如果 CAM 说是背景(0)，则强制 DCN 也不关注该区域
+            mask = mask * external_mask 
+        
+        return deform_conv2d(x, offset, self.weight, self.bias, 
+                             stride=self.stride, padding=self.padding, 
+                             mask=mask)
+
+# ==========================================================================================
+# 2. [新增] CoOp Prompt Learner (修复了 device 和硬编码问题)
+# ==========================================================================================
 class PromptLearner(nn.Module):
     def __init__(self, classnames, clip_model, n_ctx=16):
         super().__init__()
         n_cls = len(classnames)
         ctx_dim = clip_model.ln_final.weight.shape[0]
         dtype = clip_model.dtype
-        
-        # 获取 clip_model 当前所在的设备 (cpu 或 cuda)
         device = clip_model.token_embedding.weight.device 
 
-        # 1. 初始化 Learnable Context
+        # 1. 初始化 Context
         ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
         nn.init.normal_(ctx_vectors, std=0.02)
         self.ctx = nn.Parameter(ctx_vectors) 
 
-        # 2. 处理类名 (Class Names)
+        # 2. 处理 Class Prompts
         prompts = [name.replace("_", " ") for name in classnames]
         tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts]) 
-        
-        # [关键修复] 将生成的 token 移动到和 clip_model 相同的设备上
+        # 移动到正确设备
         tokenized_prompts = tokenized_prompts.to(device)
         
         with torch.no_grad():
             embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
 
-        # 3. 注册 Buffer
         self.register_buffer("token_prefix", embedding[:, :1, :]) 
         self.register_buffer("token_suffix", embedding[:, 1 + n_ctx :, :])
 
         self.n_cls = n_cls
         self.n_ctx = n_ctx
         self.clip_model = clip_model 
+        
+        # 保存 tokenized 数据以便 forward 使用，避免重复 tokenize
+        self.class_tokenized = tokenized_prompts
 
     def forward(self):
         ctx = self.ctx 
@@ -59,37 +112,38 @@ class PromptLearner(nn.Module):
             [prefix, ctx, suffix], dim=1
         ) 
 
-        # 喂给 CLIP Transformer
+        # CLIP Transformer Encoding
         x = prompts + self.clip_model.positional_embedding.type(self.clip_model.dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.clip_model.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.clip_model.ln_final(x).type(self.clip_model.dtype)
 
-        # 特征投影
-        # 这里的 PASCAL_CLASSES 需要确保已 import
-        from generate_cam_voc import PASCAL_CLASSES 
-        tokenized_prompts = torch.cat([clip.tokenize(p.replace("_", " ")) for p in PASCAL_CLASSES])
+        # 文本投影
+        # 使用 init 中保存的 token，确保设备正确
+        tokenized = self.class_tokenized.to(self.token_prefix.device)
         
-        # 同样确保 forward 里的 token 也在正确的 device 上
-        tokenized_prompts = tokenized_prompts.to(self.token_prefix.device)
-            
-        text_features = x[torch.arange(self.n_cls), tokenized_prompts.argmax(dim=-1)] @ self.clip_model.text_projection
+        # 从 prompts 中取出对应类别的特征
+        text_features = x[torch.arange(self.n_cls), tokenized.argmax(dim=-1)] @ self.clip_model.text_projection
 
         return text_features
 
-
+# ==========================================================================================
+# 3. AFANet 主模型
+# ==========================================================================================
 class afanet(nn.Module):
 
     def __init__(self, backbone, use_original_imgsize, benchmark, clip_model):
         super(afanet, self).__init__()
 
-        # 1. Backbone network initialization
+        # 1. Backbone Initialization
         self.backbone_type = backbone
         self.use_original_imgsize = use_original_imgsize
+        
         if backbone == 'vgg16':
             self.backbone = vgg.vgg16(pretrained=False)
-            ckpt = torch.load('/opt/data/private/Code/new_work/afa_baseline/Pretrain/vgg16-397923af.pth', weights_only=True)
+            # 请确认路径是否正确
+            ckpt = torch.load('/home/xhd/XD/seg/AFANet_CoOp/pretrained/vgg16-397923af.pth', weights_only=True)
             self.backbone.load_state_dict(ckpt)
             self.feat_ids = [17, 19, 21, 24, 26, 28, 30]
             self.extract_feats = extract_feat_vgg
@@ -102,14 +156,13 @@ class afanet(nn.Module):
             self.extract_feats = extract_feat_res
             nbottlenecks = [3, 4, 6, 3]
             self.conv1024_512 = nn.Conv2d(1024, 512, kernel_size=1)
-
         elif backbone == 'resnet101':
             self.backbone = resnet.resnet101(pretrained=True)
             self.feat_ids = list(range(4, 34))
             self.extract_feats = extract_feat_res
             nbottlenecks = [3, 4, 23, 3]
 
-        # === [修改] 初始化 PromptLearner ===
+        # 2. PromptLearner Initialization
         if benchmark == 'pascal':
             class_names = PASCAL_CLASSES
         elif benchmark == 'coco':
@@ -117,30 +170,31 @@ class afanet(nn.Module):
         else:
             raise Exception('Unavailable benchmark')
 
-        # 初始化 PromptLearner (n_ctx=16 是 CoOp 推荐值)
         self.prompt_learner = PromptLearner(class_names, clip_model, n_ctx=16)
         
-        # 冻结 CLIP 内部参数，只训练 ctx
+        # Freeze CLIP parameters
         for p in self.prompt_learner.clip_model.parameters():
             p.requires_grad = False
-        # =================================
 
         self.bottleneck_ids = reduce(add, list(map(lambda x: list(range(x)), nbottlenecks)))
-
         self.lids = reduce(add, [[i + 1] * x for i, x in enumerate(nbottlenecks)])
-
         self.stack_ids = torch.tensor(self.lids).bincount().__reversed__().cumsum(dim=0)[:3]
 
         self.backbone.eval()
         self.hpn_learner = HPNLearner(list(reversed(nbottlenecks[-3:])))
         self.cross_entropy_loss = nn.CrossEntropyLoss()
 
-        # fam
-        self.fam_low = Octave(512, 64)
-        self.fam_mid = Octave(1024, 64)
-        self.fam_hig = Octave(2048, 64)
-
-        self.vgg_fam = Octave(512, 64)
+        # 3. [替换] 使用 PlugAndPlayDCN 替换原有的 Octave
+        is_vgg_backbone = (backbone == 'vgg16')
+        
+        if is_vgg_backbone: 
+             # VGG 通常只处理一种尺度或特定层
+             self.vgg_fam = PlugAndPlayDCN(512, 64)
+        else:
+             # ResNet 多尺度处理
+             self.fam_low = PlugAndPlayDCN(512, 64)
+             self.fam_mid = PlugAndPlayDCN(1024, 64)
+             self.fam_hig = PlugAndPlayDCN(2048, 64)
 
         self.ncd = NeighborConnectionDecoder()
 
@@ -186,26 +240,20 @@ class afanet(nn.Module):
 
     def forward(self, query_img, support_img, support_cam, query_cam,
                 query_mask=None, support_mask=None, stage=2, w='same', class_id=None):
+        
+        # 1. Feature Extraction
         with torch.no_grad():
-
             query_feats = self.extract_feats(query_img, self.backbone, self.feat_ids, self.bottleneck_ids, self.lids)
             support_feats = self.extract_feats(support_img, self.backbone, self.feat_ids, self.bottleneck_ids, self.lids)
 
-        # === [修改] 动态计算 CoOp Text Features ===
-        # 1. 动态生成 [20, 1024] 的特征
+        # 2. CoOp Text Features Generation
         text_features_raw = self.prompt_learner() 
-        
-        # 2. 映射到 625 维度 [20, 625]
         clip_text_features = self.linear_1024_625(text_features_raw.float())
-        
-        # 3. 选取当前 batch 对应的类别 [Batch, 1, 625]
         clip_text_features = clip_text_features[class_id].unsqueeze(1) 
-
         batch, _, _ = clip_text_features.size()
         clip_text_features = clip_text_features.view(batch, 1, 25, 25)
-        # ==========================================
 
-        # extracting feature
+        # 3. Prepare Features for FAM (DCN)
         if len(query_feats) == 7:  # VGG Backbone
             isvgg = True
             q_mid_feat = F.interpolate(query_feats[3] + query_feats[4] + query_feats[5],
@@ -213,7 +261,6 @@ class afanet(nn.Module):
             s_mid_feat = F.interpolate(support_feats[3] + support_feats[4] + support_feats[5],
                                         (50, 50), mode='bilinear', align_corners=True)
 
-            # Extract features from different layers
             support_low = support_feats[1]
             support_mid = support_feats[5]
             support_hig = support_feats[6]
@@ -224,12 +271,6 @@ class afanet(nn.Module):
 
         else:
             isvgg = False  # ResNet-50 Backbone
-
-            # 0-3 low layer：     torch.Size([bs, 512, 50, 50])
-            # 4-9 middle layer：  torch.Size([bs, 1024, 25, 25])
-            # 10-12 high layer：  torch.Size([bs, 2048, 13, 13])
-
-            # Extract Cross layer
             support_low = support_feats[3]
             support_mid = support_feats[9]
             support_hig = support_feats[12]
@@ -238,30 +279,35 @@ class afanet(nn.Module):
             query_mid = query_feats[9]
             query_hig = query_feats[12]
 
-
+        # =====================================================================
+        # [修复] 准备外部 Mask (CAM)，必须在传入 DCN 之前定义
+        # =====================================================================
+        # 确保维度为 [B, 1, H, W]
+        s_cam_mask = support_cam.unsqueeze(1) if support_cam.dim() == 3 else support_cam
+        q_cam_mask = query_cam.unsqueeze(1) if query_cam.dim() == 3 else query_cam
+        
+        # 4. Feature Adaptation Module (FAM) using DCN
         if isvgg == True: # VGG
+            support_fam_low = self.vgg_fam(support_low, external_mask=s_cam_mask)
+            support_fam_mid = self.vgg_fam(support_mid, external_mask=s_cam_mask)
+            support_fam_hig = self.vgg_fam(support_hig, external_mask=s_cam_mask)
 
-            support_fam_low = self.vgg_fam(support_low)
-            support_fam_mid = self.vgg_fam(support_mid)
-            support_fam_hig = self.vgg_fam(support_hig)
+            query_fam_low = self.vgg_fam(query_low, external_mask=q_cam_mask)
+            query_fam_mid = self.vgg_fam(query_mid, external_mask=q_cam_mask)
+            query_fam_hig = self.vgg_fam(query_hig, external_mask=q_cam_mask)
 
-            query_fam_low = self.vgg_fam(query_low)
-            query_fam_mid = self.vgg_fam(query_mid)
-            query_fam_hig = self.vgg_fam(query_hig)
+        else: # ResNet
+            support_fam_low = self.fam_low(support_low, external_mask=s_cam_mask)
+            support_fam_mid = self.fam_mid(support_mid, external_mask=s_cam_mask)
+            support_fam_hig = self.fam_hig(support_hig, external_mask=s_cam_mask)
 
-        else: # resnet
-
-            support_fam_low = self.fam_low(support_low)
-            support_fam_mid = self.fam_mid(support_mid)
-            support_fam_hig = self.fam_hig(support_hig)
-
-            query_fam_low = self.fam_low(query_low)
-            query_fam_mid = self.fam_mid(query_mid)
-            query_fam_hig = self.fam_hig(query_hig)
-
-        # NCD
-        support_ncd_feats = self.ncd(support_fam_low, support_fam_mid, support_fam_hig)  # ([4, 1, 50, 50])
-        query_ncd_feats = self.ncd(query_fam_low, query_fam_mid, query_fam_hig)  # ([4, 1, 50, 50])
+            query_fam_low = self.fam_low(query_low, external_mask=q_cam_mask)
+            query_fam_mid = self.fam_mid(query_mid, external_mask=q_cam_mask)
+            query_fam_hig = self.fam_hig(query_hig, external_mask=q_cam_mask)
+        
+        # 5. Neighbor Connection Decoder (NCD)
+        support_ncd_feats = self.ncd(support_fam_low, support_fam_mid, support_fam_hig)
+        query_ncd_feats = self.ncd(query_fam_low, query_fam_mid, query_fam_hig)
 
         support_ncd_feats = self.bn(support_ncd_feats)
         support_ncd_feats = self.relu(support_ncd_feats)
@@ -270,14 +316,13 @@ class afanet(nn.Module):
         query_ncd_feats = self.relu(query_ncd_feats)
 
         with torch.no_grad():
+            s_ncd_reshape = F.interpolate(support_ncd_feats, scale_factor=0.5, mode='bilinear')
+            s_multimodal = torch.mul(s_ncd_reshape, clip_text_features)
+            s_multimodal = F.interpolate(s_multimodal, scale_factor=2, mode='bilinear')
 
-            s_ncd_reshape = F.interpolate(support_ncd_feats, scale_factor=0.5, mode='bilinear')  # (4,1,25,25)
-            s_multimodal = torch.mul(s_ncd_reshape, clip_text_features)  # 逐元素乘法
-            s_multimodal = F.interpolate(s_multimodal, scale_factor=2, mode='bilinear')  # ([4, 1, 50, 50])
-
-            q_ncd_reshape = F.interpolate(query_ncd_feats, scale_factor=0.5, mode='bilinear')  # (4,1,25,25)
+            q_ncd_reshape = F.interpolate(query_ncd_feats, scale_factor=0.5, mode='bilinear')
             q_multimodal = torch.mul(q_ncd_reshape, clip_text_features)
-            q_multimodal = F.interpolate(q_multimodal, scale_factor=2, mode='bilinear')  # ([4, 1, 50, 50])
+            q_multimodal = F.interpolate(q_multimodal, scale_factor=2, mode='bilinear')
 
         query_feats_masked = self.mask_feature(query_feats, query_cam.clone())
         support_feats_masked = self.mask_feature(support_feats, support_cam.clone())
@@ -285,8 +330,11 @@ class afanet(nn.Module):
         corr_query = Correlation.multilayer_correlation(query_feats, support_feats_masked, self.stack_ids)
         corr_support = Correlation.multilayer_correlation(support_feats, query_feats_masked, self.stack_ids)
 
-        query_cam = query_cam.unsqueeze(1)
-        support_cam = support_cam.unsqueeze(1)
+        # 这里的 cam 之前已经被 unsqueeze 处理过了吗？
+        # 原代码有这行，保留以防万一，但注意上面已经定义了 s_cam_mask
+        # 这里对 query_cam, support_cam 重新赋值用于后面的 concat
+        query_cam = query_cam.unsqueeze(1) if query_cam.dim() == 3 else query_cam
+        support_cam = support_cam.unsqueeze(1) if support_cam.dim() == 3 else support_cam
 
         bsz = query_img.shape[0]
 
@@ -295,7 +343,9 @@ class afanet(nn.Module):
             mfa_state_support = self.state.expand(bsz, -1, -1, -1)
 
         losses = 0
-        for ss in range(stage):  # iteration (IMR-HSNet)
+        
+        # 6. Iterative Multi-Resolution (IMR) Loop
+        for ss in range(stage): 
 
             # mfa query
             after4d_query = self.hpn_learner.forward_conv4d(corr_query)
@@ -323,7 +373,6 @@ class afanet(nn.Module):
             mfa_state_query = (1 - imr_z_query) * mfa_state_query + imr_z_query * state_new_query
 
             # MFA support
-
             after4d_support = self.hpn_learner.forward_conv4d(corr_support)
             imr_x_support = torch.cat([support_cam, after4d_support, s_multimodal, mfa_state_support], dim=1)
 
@@ -347,7 +396,6 @@ class afanet(nn.Module):
             mfa_state_support = (1 - imr_z_support) * mfa_state_support + imr_z_support * state_new_support
 
             # decoder
-
             hypercorr_decoded_s = self.decoder1(mfa_state_support + after4d_support)
 
             upsample_size = (hypercorr_decoded_s.size(-1) * 2,) * 2  # (100, 100)
@@ -368,7 +416,7 @@ class afanet(nn.Module):
                 torch.cat([logit_mask_query, F.interpolate(query_cam, (100, 100), mode='bilinear', align_corners=True)],
                           dim=1))
 
-            # loss
+            # loss computation
             if query_mask is not None:  # for training
                 if not self.use_original_imgsize:
                     logit_mask_query_temp = F.interpolate(logit_mask_query, support_img.size()[2:], mode='bilinear',
@@ -402,7 +450,6 @@ class afanet(nn.Module):
             return logit_mask_query, logit_mask_support
 
     def mask_feature(self, features, support_mask):
-
         for idx, feature in enumerate(features):
             mask = F.interpolate(
                 support_mask.unsqueeze(1).float(), feature.size()[2:], mode='bilinear', align_corners=True)
