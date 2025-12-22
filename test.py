@@ -1,8 +1,6 @@
 r""" AFANet testing code  """
 import argparse
 import os
-
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 import torch.nn.functional as F
 import torch.nn as nn
 import torch
@@ -12,9 +10,7 @@ from common.vis import Visualizer
 from common.evaluation import Evaluator
 from common import utils
 from data.dataset import FSSDataset
-
 import clip
-
 
 def test(model, dataloader, nshot, stage):
     r""" Test AFANet """
@@ -40,7 +36,6 @@ def test(model, dataloader, nshot, stage):
 
         # Visualize predictions
         if Visualizer.visualize:
-            
             Visualizer.visualize_prediction_batch(batch['support_imgs'], batch['support_masks'],
                                                   batch['query_img'], batch['query_mask'],
                                                   pred_mask,
@@ -58,27 +53,22 @@ if __name__ == '__main__':
 
     # Arguments parsing
     parser = argparse.ArgumentParser(description='AFANet Pytorch Implementation')
-    parser.add_argument('--datapath', type=str, default='/opt/data/private/Data/afanet_data/')
+    parser.add_argument('--datapath', type=str, default='/home/xhd/XD/datasets/AFANet_datasets/')
     parser.add_argument('--benchmark', type=str, default='pascal', choices=['pascal', 'coco', 'fss'])
     parser.add_argument('--logpath', type=str, default='')
     parser.add_argument('--bsz', type=int, default=1)  # must be 1
-    parser.add_argument('--nworker', type=int, default=32)
-    parser.add_argument('--load', type=str,
-                        default='/opt/data/private/Out/new_work_logs/afa_4/ori_voc_67.76/best_model.pt')
+    parser.add_argument('--nworker', type=int, default=16)
+    parser.add_argument('--load', type=str, required=True, help='Path to the model to load')
     parser.add_argument('--fold', type=int, default=0, choices=[0, 1, 2, 3])
     parser.add_argument('--nshot', type=int, default=1)
     parser.add_argument('--backbone', type=str, default='resnet50', choices=['vgg16', 'resnet50', 'resnet101'])
-    parser.add_argument('--visualize', default='visualize')  # or just: default='visualize' action='store_true'
-    parser.add_argument('--use_original_imgsize', action='store_true')  # action='store_true'
-    parser.add_argument('--stage', type=int, default=2)  ##  coco set 3
+    parser.add_argument('--visualize', action='store_true') 
+    parser.add_argument('--use_original_imgsize', action='store_true') 
+    parser.add_argument('--stage', type=int, default=2) 
 
-    parser.add_argument('--traincampath', type=str, default='/opt/data/private/Out/afanet/voc_cam/CAM_VOC_Train/')
-    parser.add_argument('--valcampath', type=str, default='/opt/data/private/Out/afanet/voc_cam/CAM_VOC_Val/')
-
-    # parser.add_argument('--traincampath', type=str, default='/opt/data/private/Out/afanet/coco_cam/')
-    # parser.add_argument('--valcampath', type=str, default='/opt/data/private/Out/afanet/coco_cam/')
-
-    parser.add_argument('--vispath', type=str, default='/opt/data/private/Code/new_work/afa_4/vis/')
+    parser.add_argument('--traincampath', type=str, default='/home/xhd/XD/datasets/AFANet_datasets/CAM_VOC_Train/')
+    parser.add_argument('--valcampath', type=str, default='/home/xhd/XD/datasets/AFANet_datasets/CAM_VOC_Val/')
+    parser.add_argument('--vispath', type=str, default='./vis/')
 
     args = parser.parse_args()
     Logger.initialize(args, training=False)
@@ -88,8 +78,11 @@ if __name__ == '__main__':
 
     # Model initialization
     clip_model, _ = clip.load('RN50', device=device, jit=False)
+    
+    # [修改 1] 强制转为 FP32，与 Train 保持一致
+    clip_model.float() 
 
-    model = afanet(args.backbone, args.use_original_imgsize, args.benchmark, clip_model)  # AFANet model
+    model = afanet(args.backbone, args.use_original_imgsize, args.benchmark, clip_model)
     model.eval()
 
     Logger.log_params(model)
@@ -98,12 +91,41 @@ if __name__ == '__main__':
     model = nn.DataParallel(model)
     model.to(device)
 
-    # Load trained model
+    # [修改 2] 鲁棒的模型加载逻辑
     if args.load == '':
         raise Exception('Pretrained model not specified.')
-    model.load_state_dict(torch.load(args.load, weights_only=True))
+    
+    Logger.info(f'Loading model from {args.load}...')
+    try:
+        # map_location 避免 GPU 数量不一致时的报错
+        checkpoint = torch.load(args.load, map_location=device)
+        
+        # 检查是否是 Checkpoint 字典（包含 epoch, optimizer 等）
+        if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['state_dict'])
+            Logger.info("Loaded state_dict from checkpoint dictionary.")
+        else:
+            # 假设是纯粹的 state_dict (如 best_model.pt)
+            model.load_state_dict(checkpoint)
+            Logger.info("Loaded raw state_dict.")
+            
+    except Exception as e:
+        Logger.info(f"Error loading model: {e}")
+        raise e
 
-    # Helper classes (for testing) initialization
+    # [修改 3] 强制设置推理时的 Temperature
+    # 训练结束时 temperature 为 5.0 (或者你设定的 end_temp)。
+    # 测试时应使用这个值，以获得最清晰的 Mask。
+    # 注意：如果 TSL 模块不在 module 下（单卡），代码会自动处理，但 DataParallel 下通常在 module 里
+    inference_temp = 5.0
+    if hasattr(model.module, 'tsl'):
+         model.module.tsl.update_all_temperatures(inference_temp)
+    elif hasattr(model, 'tsl'): # 兼容单卡情况
+         model.tsl.update_all_temperatures(inference_temp)
+    
+    Logger.info(f"Set inference temperature to: {inference_temp}")
+
+    # Helper classes initialization
     Evaluator.initialize()
     Visualizer.initialize(args.visualize, args.vispath)
 
@@ -112,7 +134,6 @@ if __name__ == '__main__':
                                                   cam_train_path=args.traincampath, cam_val_path=args.valcampath)
 
     # Test AFANet
-
     with torch.no_grad():
         test_miou, test_fb_iou = test(model, dataloader_test, args.nshot, args.stage)
 

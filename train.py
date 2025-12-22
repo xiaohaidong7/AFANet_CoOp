@@ -9,7 +9,7 @@ import torch
 import random
 import numpy as np
 import matplotlib.pyplot as plt
-import re  # [新增] 正则表达式库，用于解析 log.txt
+import re 
 
 from common.logger import Logger, AverageMeter
 from common.evaluation import Evaluator
@@ -47,7 +47,7 @@ def plot_loss_curve(train_losses, val_losses, save_path):
     plt.savefig(os.path.join(save_path, 'loss_curve.png'))
     plt.close()
 
-# [新增] 从 log.txt 恢复 Loss 历史的函数
+# 从 log.txt 恢复 Loss 历史的函数
 def recover_history_from_log(log_file_path):
     train_losses = []
     val_losses = []
@@ -61,11 +61,9 @@ def recover_history_from_log(log_file_path):
         lines = f.readlines()
         
     # 正则表达式匹配 log.txt 中的结果行
-    # 格式示例: *** Training [@Epoch 00] Avg L: 1.97244 ...
     train_pattern = re.compile(r'\*\*\* Training \[@Epoch (\d+)\] Avg L: ([\d\.]+)')
     val_pattern = re.compile(r'\*\*\* Validation \[@Epoch (\d+)\] Avg L: ([\d\.]+)')
     
-    # 临时字典存储，防止顺序乱
     train_dict = {}
     val_dict = {}
 
@@ -83,7 +81,6 @@ def recover_history_from_log(log_file_path):
             loss = float(v_match.group(2))
             val_dict[epoch] = loss
 
-    # 按 epoch 顺序转回 list
     max_epoch = max(max(train_dict.keys(), default=-1), max(val_dict.keys(), default=-1))
     
     for i in range(max_epoch + 1):
@@ -116,10 +113,8 @@ def train(epoch, model, dataloader, optimizer, training, stage):
         if training:
             optimizer.zero_grad()  
             loss.backward()
-            # === [新增] 梯度裁剪 =====================================================================
-            # 将梯度限制在 [-10, 10] 之间，防止个别样本导致梯度爆炸
+            # === 梯度裁剪 ===
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
-            # ========================================================================================
             optimizer.step()
         
         area_inter, area_union = Evaluator.classify_prediction(pred_mask_q, batch)  
@@ -150,7 +145,7 @@ if __name__ == '__main__':
 
     parser.add_argument('--traincampath', type=str, default='/home/xhd/XD/datasets/AFANet_datasets/CAM_VOC_Train/')
     parser.add_argument('--valcampath', type=str, default='/home/xhd/XD/datasets/AFANet_datasets/CAM_VOC_Val/')
-    parser.add_argument('--seed', type=int, default=6776)
+    parser.add_argument('--seed', type=int, default=3407)
     parser.add_argument('--resume', type=str, default='', help='Path to checkpoint file to resume from')
 
     args = parser.parse_args()
@@ -169,9 +164,8 @@ if __name__ == '__main__':
     # Model initialization
     clip_model, _ = clip.load('RN50', device= device, jit=False)
 
-    # === [新增] 强制转为 FP32 =====================
+    # === 强制转为 FP32 ===
     clip_model.float() 
-    # ============================================
 
     model = afanet(args.backbone, False, args.benchmark, clip_model)
     Logger.log_params(model)
@@ -179,18 +173,22 @@ if __name__ == '__main__':
     model = nn.DataParallel(model)
     model.to(device)
 
-    # ================= [修改] 优化器配置 =================
+    # ================= 优化器配置 =================
     # CoOp 策略：Prompt 参数用大 LR，其他参数用正常 LR，Backbone/CLIP 冻结
     
     param_groups = []
     prompt_params = []
     decoder_params = []
     
+    # 调试 CoOp 参数是否正确被识别
+    found_ctx = False
+
     for name, param in model.named_parameters():
         if "prompt_learner.ctx" in name:
             # 1. Prompt 向量 (核心)
             param.requires_grad = True
             prompt_params.append(param)
+            found_ctx = True
         elif "prompt_learner" in name or "clip_model" in name:
             # 2. CLIP 内部参数 (冻结)
             param.requires_grad = False
@@ -201,8 +199,12 @@ if __name__ == '__main__':
             # 4. AFANet Decoder / Linear (正常训练)
             param.requires_grad = True
             decoder_params.append(param)
+            
+    if not found_ctx:
+        print("WARNING: CoOp Context Vector (ctx) NOT found! Please check model structure.")
+    else:
+        print("DEBUG: CoOp Context Vector detected and set to trainable.")
     
-    # 计算真实的参数元素总数 (numel = number of elements)
     num_prompt_elements = sum(p.numel() for p in prompt_params)
     num_decoder_elements = sum(p.numel() for p in decoder_params)
 
@@ -213,8 +215,8 @@ if __name__ == '__main__':
     Logger.info(f"Num of Decoder Params (Elements): {num_decoder_elements}")
 
     optimizer = optim.Adam([
-        {"params": prompt_params, "lr": args.lr_prompt},    # CoOp 推荐 LR，通常比主 LR 大 10-50 倍
-        {"params": decoder_params, "lr": args.lr} # 保持 args.lr (4e-4)
+        {"params": prompt_params, "lr": args.lr_prompt},    # CoOp 推荐 LR
+        {"params": decoder_params, "lr": args.lr} 
     ])
     # ====================================================
 
@@ -231,45 +233,65 @@ if __name__ == '__main__':
     start_epoch = 0 
     train_loss_history = []
     val_loss_history = []
+    best_model_state_cache = None # 初始化缓存
 
-    # ================= [关键修改] 断点续训逻辑 =================
+    # ================= 断点续训逻辑 (鲁棒版) =================
     if args.resume:
         if os.path.isfile(args.resume):
             Logger.info(f"==> Loading checkpoint '{args.resume}'")
             checkpoint = torch.load(args.resume)
             
-            # 恢复训练状态
+            # 1. 恢复基础训练状态
             start_epoch = checkpoint.get('epoch', 0) + 1
-            # 如果加载的是 best_model.pt，它里面可能没有 'epoch' 字段或者 epoch 值是当时 best 的值
-            # 这种情况下 start_epoch 可能会回滚，但通常我们接受这个风险，或者手动指定
-            
             best_val_miou = checkpoint.get('best_val_miou', float('-inf'))
             model.load_state_dict(checkpoint['state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer'])
             
-            # --- 恢复 Loss History (双保险) ---
-            # 1. 优先尝试从 Checkpoint 里读
+            # 2. 恢复 Loss History
             if 'train_loss_history' in checkpoint and len(checkpoint['train_loss_history']) > 0:
                 Logger.info("==> Recovered loss history from checkpoint.")
                 train_loss_history = checkpoint['train_loss_history']
                 val_loss_history = checkpoint['val_loss_history']
             else:
-                # 2. 如果 Checkpoint 里没有，尝试从 log.txt 解析
+                # 兼容旧逻辑：尝试从 log.txt 解析
                 Logger.info("==> No history in checkpoint. Trying to recover from log.txt...")
                 log_file = os.path.join(Logger.logpath, 'log.txt')
                 recovered_train, recovered_val = recover_history_from_log(log_file)
                 if len(recovered_train) > 0:
                     train_loss_history = recovered_train
                     val_loss_history = recovered_val
-                    # 修正 start_epoch，防止 log 内容比 checkpoint 还新
-                    # (可选: start_epoch = max(start_epoch, len(train_loss_history)))
                 else:
                     Logger.info("==> Could not recover history. Starting fresh plotting.")
 
-            # 裁剪一下 history，防止重复。比如从 epoch 30 resume，但 history 里有 50 个数据
+            # 裁剪 history 防止重复
             if len(train_loss_history) > start_epoch:
                 train_loss_history = train_loss_history[:start_epoch]
                 val_loss_history = val_loss_history[:start_epoch]
+
+            # 3. 恢复 Best Model Cache (关键步骤)
+            if 'best_model_state_cache' in checkpoint:
+                best_model_state_cache = checkpoint['best_model_state_cache']
+                Logger.info(f"==> Recovered best model cache (mIoU: {best_val_miou:.4f}) from RAM snapshot.")
+            else:
+                # 尝试从磁盘加载现有的 best_model.pt 补救
+                best_model_disk_path = os.path.join(Logger.logpath, 'best_model.pt')
+                if os.path.exists(best_model_disk_path):
+                    Logger.info(f"==> Loading existing best model from disk: {best_model_disk_path}")
+                    try:
+                        disk_checkpoint = torch.load(best_model_disk_path, map_location='cpu')
+                        if isinstance(disk_checkpoint, dict) and 'state_dict' in disk_checkpoint:
+                            best_model_state_cache = disk_checkpoint['state_dict']
+                        elif isinstance(disk_checkpoint, dict):
+                            best_model_state_cache = disk_checkpoint
+                        else:
+                            best_model_state_cache = None
+                        Logger.info("==> Successfully initialized best model cache from disk.")
+                    except:
+                        best_model_state_cache = None
+                        Logger.info("==> Failed to load disk model. Cache is None.")
+                else:
+                    best_model_state_cache = None
+                    Logger.info("==> No cache found. Will start caching from next best.")
 
             Logger.info(f"==> Loaded checkpoint (resume from epoch {start_epoch})")
         else:
@@ -281,6 +303,15 @@ if __name__ == '__main__':
 
     for epoch in range(start_epoch, args.niter):  
         epoch_start_time = datetime.now() 
+        
+        # === Temperature Annealing (温度退火) ===
+        if isinstance(model, nn.DataParallel):
+            current_temp = model.module.adjust_temperature(epoch, args.niter)
+        else:
+            current_temp = model.adjust_temperature(epoch, args.niter)
+        
+        Logger.info(f"Epoch [{epoch}/{args.niter}] - Updated Sparse Block Temperature to: {current_temp:.4f}")
+        # ========================================
 
         trn_loss, trn_miou, trn_fb_iou = train(epoch, model, dataloader_trn, optimizer, training=True, stage=args.stage)
         
@@ -292,25 +323,44 @@ if __name__ == '__main__':
         
         plot_loss_curve(train_loss_history, val_loss_history, Logger.logpath)
 
-        # 始终保存最佳模型 (注意: best_model.pt 依然只存参数，不存 history，保持轻量)
+        # 始终保存最佳模型 (覆盖式)
         if val_miou > best_val_miou:
             best_val_miou = val_miou
             best_epoch = epoch
+            
             Logger.save_model_miou(model, epoch, val_miou)
+            
+            # [关键] 更新内存中的最佳参数缓存
+            current_state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+            best_model_state_cache = {k: v.cpu().clone() for k, v in current_state.items()}
+            
+            Logger.info(f"  ==> New Best mIoU: {best_val_miou:.4f} (at Epoch {epoch}) - Cached in memory.")
         
-        # 保存 Checkpoint (包含 history)
+        # === 周期性保存 (Checkpoint & Snapshot) ===
         if (epoch + 1) % 10 == 0:
+            # A. 保存常规 Checkpoint
             checkpoint_path = os.path.join(Logger.logpath, f'checkpoint_ep{epoch}.pth')
             state = {
                 'epoch': epoch,
-                'state_dict': model.state_dict(),
+                'state_dict': model.state_dict(), 
                 'optimizer': optimizer.state_dict(),
                 'best_val_miou': best_val_miou,
                 'train_loss_history': train_loss_history, 
-                'val_loss_history': val_loss_history
+                'val_loss_history': val_loss_history,
+                'best_model_state_cache': best_model_state_cache 
             }
             torch.save(state, checkpoint_path)
-            print(f'Checkpint saved: {checkpoint_path}')
+            print(f'Checkpoint saved: {checkpoint_path}')
+
+            # B. 保存累计最优快照
+            if best_model_state_cache is not None:
+                snapshot_name = f'best_model_snapshot_0_{epoch}.pt'
+                snapshot_path = os.path.join(Logger.logpath, snapshot_name)
+                
+                torch.save(best_model_state_cache, snapshot_path)
+                Logger.info(f"==> [Snapshot] Saved best model of epochs 0-{epoch} to {snapshot_name} (mIoU: {best_val_miou:.4f})")
+            else:
+                Logger.info(f"==> [Snapshot] Skipped (No best model found yet).")
 
         Logger.tbd_writer.add_scalars('data/loss', {'trn_loss': trn_loss, 'val_loss': val_loss}, epoch)
         Logger.tbd_writer.add_scalars('data/miou', {'trn_miou': trn_miou, 'val_miou': val_miou}, epoch)

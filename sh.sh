@@ -6,7 +6,7 @@ python generate_cam_voc.py --traincampath /home/xhd/XD/datasets/AFANet_datasets/
 
 #训练脚本-------------------------------------------------------------------------------------------------
 python train.py \
-  --backbone vgg16 \
+  --backbone resnet50 \
   --fold 0 \
   --benchmark pascal \
   --bsz 8 \
@@ -14,7 +14,7 @@ python train.py \
   --lr_prompt 0.002 \
   --niter 50 \
   --stage 2 \
-  --logpath "pascal_vgg16_fold0_coop" \
+  --logpath "pascal_resnet50_fold0_coop_1221" \
   --traincampath /home/xhd/XD/datasets/AFANet_datasets/CAM_VOC_Train/ \
   --valcampath /home/xhd/XD/datasets/AFANet_datasets/CAM_VOC_Val/ \
   --datapath /home/xhd/XD/datasets/AFANet_datasets/

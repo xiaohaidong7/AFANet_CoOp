@@ -3,182 +3,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import clip
-
+from torchvision.ops import deform_conv2d
 
 class BasicConv2d(nn.Module):
-    def __init__(self, in_planes, out_planes, kernel_size, stride=1, padding=0, dilation=1, groups=1):
+    def __init__(self, in_planes, out_planes, kernel_size, stride=1, padding=0):
         super(BasicConv2d, self).__init__()
-        self.conv = nn.Conv2d(in_planes, out_planes,
-                              kernel_size=kernel_size, stride=stride,
-                              padding=padding, dilation=dilation, bias=False, groups=groups)
+        self.conv = nn.Conv2d(in_planes, out_planes, kernel_size=kernel_size, 
+                              stride=stride, padding=padding, bias=False)
         self.bn = nn.BatchNorm2d(out_planes) 
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        x = self.conv(x)
-        x = self.bn(x)
-        return x
-
-
-class FirstOctaveConv(nn.Module):   # 对应第一个红色和绿色
-      
-    def __init__(self, in_channels, out_channels,kernel_size, alpha=0.5, stride=1, padding=1, dilation=1,
-                 groups=1, bias=False):
-        super(FirstOctaveConv, self).__init__()
-        self.stride = stride
-        kernel_size = kernel_size[0]   # 3
-        self.h2g_pool = nn.AvgPool2d(kernel_size=(2, 2), stride=2)
-        self.h2l = torch.nn.Conv2d(in_channels, int(alpha * in_channels), # (512,256)
-                                   kernel_size, 1, padding, dilation, groups, bias)
-        self.h2h = torch.nn.Conv2d(in_channels, in_channels - int(alpha * in_channels), 
-                                   kernel_size, 1, padding, dilation, groups, bias)
-
-    def forward(self, x):    # x：n,c,h,w
-        if self.stride ==2:
-            x = self.h2g_pool(x)
-
-        X_h2l = self.h2g_pool(x) # 低频
-        X_h = x
-        X_h = self.h2h(X_h)   # 高频
-        X_l = self.h2l(X_h2l) # 低频
-
-        return X_h, X_l
-
-class OctaveConv(nn.Module): # 低、高频输入，低、高频输出 对应第二个红色和绿色
-    def __init__(self, in_channels, out_channels, kernel_size, alpha=0.5, stride=1, padding=1, dilation=1,
-                 groups=1, bias=False):
-        super(OctaveConv, self).__init__()
-        kernel_size = kernel_size[0]
-        self.h2g_pool = nn.AvgPool2d(kernel_size=(2, 2), stride=2)
-        self.upsample = torch.nn.Upsample(scale_factor=2, mode='nearest')
-        self.stride = stride
-        # 低到低，通道缩一半
-        self.l2l = torch.nn.Conv2d(int(alpha * in_channels), int(alpha * out_channels),
-                                   kernel_size, 1, padding, dilation, groups, bias)
-        
-        # 低到高，改变输出通道
-        self.l2h = torch.nn.Conv2d(int(alpha * in_channels), out_channels - int(alpha * out_channels),
-                                   kernel_size, 1, padding, dilation, groups, bias)
-        
-        # 高到低，输出通道减一半，改变输入通道
-        self.h2l = torch.nn.Conv2d(in_channels - int(alpha * in_channels), int(alpha * out_channels),
-                                   kernel_size, 1, padding, dilation, groups, bias)
-        
-        # 高到高，输出、输入通道都改变
-        self.h2h = torch.nn.Conv2d(in_channels - int(alpha * in_channels),
-                                   out_channels - int(alpha * out_channels),
-                                   kernel_size, 1, padding, dilation, groups, bias)
-
-    def forward(self, x):
-        X_h, X_l = x
-
-        if self.stride == 2:
-            X_h, X_l = self.h2g_pool(X_h), self.h2g_pool(X_l)
-
-        X_h2l = self.h2g_pool(X_h)
-
-        X_h2h = self.h2h(X_h)
-        X_l2h = self.l2h(X_l)
-
-        X_l2l = self.l2l(X_l)
-        X_h2l = self.h2l(X_h2l)
-
-        X_l2h = F.interpolate(X_l2h, (int(X_h2h.size()[2]),int(X_h2h.size()[3])), mode='bilinear')
-
-        X_h = X_l2h + X_h2h
-        X_l = X_h2l + X_l2l
-
-        return X_h, X_l
-
-class LastOctaveConv(nn.Module): # 低频和高频对齐输出
-    def __init__(self, in_channels, out_channels, kernel_size, alpha=0.5, stride=1, padding=1, dilation=1,
-                 groups=1, bias=False):
-        super(LastOctaveConv, self).__init__()   # 继承 nn.Module 的一些属性和方法
-        self.stride = stride
-        kernel_size = kernel_size[0]
-        self.h2g_pool = nn.AvgPool2d(kernel_size=(2, 2), stride=2)
-
-        self.l2h = torch.nn.Conv2d(int(alpha * out_channels), out_channels,
-                                   kernel_size, 1, padding, dilation, groups, bias)
-        self.h2h = torch.nn.Conv2d(out_channels - int(alpha * out_channels),
-                                   out_channels,
-                                   kernel_size, 1, padding, dilation, groups, bias)
-        self.upsample = torch.nn.Upsample(scale_factor=2, mode='nearest')
-    def forward(self, x):
-        X_h, X_l = x
-
-        if self.stride == 2:
-            X_h, X_l = self.h2g_pool(X_h), self.h2g_pool(X_l)
-
-        X_h2h = self.h2h(X_h) # 高频组对齐通道
-        X_l2h = self.l2h(X_l) # 低频组对齐通道
-        # 低频组对齐长宽尺寸
-        X_l2h = F.interpolate(X_l2h, (int(X_h2h.size()[2]), int(X_h2h.size()[3])), mode='bilinear') 
-
-        X_h = X_h2h + X_l2h  
-        return X_h       
-
-class Octave(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=(3, 3)):
-        super(Octave, self).__init__()
-        # 第一层，将特征分为高频和低频
-        self.fir = FirstOctaveConv(in_channels, out_channels, kernel_size)
-
-        # 第二层，低高频输入，低高频输出
-        self.mid1 = OctaveConv(in_channels, in_channels, kernel_size)   # 同频输入、输出
-        self.mid2 = OctaveConv(in_channels, out_channels, kernel_size)  # 不同频输入、输出
-
-        # 第三层，将低高频汇合后输出
-        self.lst = LastOctaveConv(in_channels, out_channels, kernel_size)
-
-    def forward(self, x):   
-        x0 = x
-        x_h, x_l = self.fir(x)                   
-        x_hh, x_ll = x_h, x_l,
-        # x_1 = x_hh +x_ll
-        x_h_1, x_l_1 = self.mid1((x_h, x_l))     
-        x_h_2, x_l_2 = self.mid1((x_h_1, x_l_1)) 
-        x_h_5, x_l_5 = self.mid2((x_h_2, x_l_2)) 
-        x_ret = self.lst((x_h_5, x_l_5)) 
-        return x_ret
-    
-class NeighborConnectionDecoder(nn.Module):
-    def __init__(self, channel=64):
-        super(NeighborConnectionDecoder, self).__init__()
-        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)  # 放大两倍
-
-
-        self.conv_upsample1 = BasicConv2d(channel, channel, 3, padding=1)
-        self.conv_upsample2 = BasicConv2d(channel, channel, 3, padding=1)
-        self.conv_upsample3 = BasicConv2d(channel, channel, 3, padding=1)
-        self.conv_upsample4 = BasicConv2d(channel, channel, 3, padding=1)
-        self.conv_upsample5 = BasicConv2d(2 * channel, 2 * channel, 3, padding=1)
-
-        self.conv_concat2 = BasicConv2d(2 * channel, 2 * channel, 3, padding=1)
-        self.conv_concat3 = BasicConv2d(3 * channel, 3 * channel, 3, padding=1)
-        self.conv4 = BasicConv2d(3 * channel, 3 * channel, 3, padding=1)
-        self.conv5 = nn.Conv2d(3 * channel, 128, 1)  
-
-    def forward(self, x1, x2, x3):  # for (low, mid, hig)
-        
-        x_low = x1  
-        x_mid = x2  
-        x_hig = x3  
-        
-        x_2_1 = x_low * self.conv_upsample1(self.upsample(input=x_mid))   
-        x_2_2 = x_mid * self.conv_upsample1(F.interpolate(x_hig, (25,25), mode='bilinear', align_corners=True))   # ([4, 64, 25, 25])
-        
-        x_3_1 = x_2_1 * self.conv_upsample1(self.upsample(x_2_2))   
-        
-        c_3_2 = torch.cat((x_2_2, self.conv_upsample1(F.interpolate(x_hig, (25,25), mode='bilinear', align_corners=True))), 1)
-
-        c_4 = torch.cat((x_3_1, self.conv_upsample5(self.upsample(input=c_3_2))), 1) 
-        c_4 = self.conv_concat3(c_4)   
-        
-        x = self.conv4(c_4)
-        x = self.conv5(x)
-
-        return x
+        return self.relu(self.bn(self.conv(x)))
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 def zeroshot_classifier(classnames, templates, model):
@@ -211,6 +47,9 @@ class PlugAndPlayDCN(nn.Module):
         # 2. 预测 offset 和 mask
         self.p_conv = nn.Conv2d(in_channels, 3 * kernel_size * kernel_size, 
                                 kernel_size=kernel_size, padding=padding, stride=stride)
+
+        # [新增] 定义 offset 的最大偏移限制 (通常设为 kernel_size 左右)
+        self.max_offset_limit = float(kernel_size)
         
         # 初始化
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
@@ -227,6 +66,10 @@ class PlugAndPlayDCN(nn.Module):
         o1, o2, mask = torch.chunk(out, 3, dim=1)
         offset = torch.cat([o1, o2], dim=1)
         
+        # [优化1] 限制 Offset 范围，增加稳定性
+        # 将偏移限制在 [-k, k] 之间，防止训练初期梯度爆炸导致的采样点飞离
+        offset = torch.tanh(offset) * self.max_offset_limit
+
         # DCN 自身学到的 Mask (0~1)
         mask = torch.sigmoid(mask)
         
@@ -239,7 +82,8 @@ class PlugAndPlayDCN(nn.Module):
             
             # 广播机制：[B, 1, H, W] * [B, 9, H, W] -> [B, 9, H, W]
             # 逻辑：如果 CAM 说是背景(0)，那么无论 DCN 想看哪里，最终权重都被置为 0
-            mask = mask * external_mask 
+            # mask = mask * external_mask 
+            mask = mask + 0.5 * external_mask  # 软注入，保留部分 DCN 自身信息
         # ==============================
         
         return deform_conv2d(x, offset, self.weight, self.bias, 
@@ -247,4 +91,118 @@ class PlugAndPlayDCN(nn.Module):
                              mask=mask)
 # ========================================================================================================================
 
+# 稀疏融合========================================================================================================================
 
+
+class LearnableResidualSparseBlock(nn.Module):
+    def __init__(self, in_channels, init_ratio=0.5, temp=5.0):
+        """
+        Args:
+            in_channels: 输入通道
+            init_ratio: 期望初始保留的比例 (0.0 ~ 1.0)。
+                        例如 0.6 表示初始状态下，当输入特征为平均值时，Mask输出约为 0.6。
+            temp: 温度系数，控制 Mask 的陡峭程度。
+        """
+        super(LearnableResidualSparseBlock, self).__init__()
+        
+        # 1. 显著性特征提取
+        self.salience_conv = nn.Sequential(
+            nn.Conv2d(in_channels, 1, kernel_size=1),
+            nn.BatchNorm2d(1) # BN 保证 scores 分布在 0 附近，方差为 1
+        )
+        
+        self.temp = temp
+
+        # 2. 自动计算阈值的初始值
+        # 数学推导: Sigmoid( (0 - threshold) * temp ) = init_ratio
+        # => threshold = - (ln(ratio / (1-ratio))) / temp
+        # 限制 ratio 防止 log(0)
+        eps = 1e-6
+        init_ratio = max(eps, min(1 - eps, init_ratio))
+        init_logit = math.log(init_ratio / (1 - init_ratio))
+        init_thresh = -init_logit / temp
+        
+        self.threshold = nn.Parameter(torch.tensor(init_thresh))
+        
+        # 3. 增强权重
+        self.enhance_weight = nn.Parameter(torch.tensor(1.0))
+        
+        # 4. 用于可视化/调试的缓存变量
+        self.last_mask = None 
+
+    def forward(self, x):
+        # x: [B, C, H, W]
+        
+        # [B, 1, H, W]
+        scores_logit = self.salience_conv(x)
+        
+        # 生成 Mask
+        # (Score - Threshold) * Temp
+        diff = (scores_logit - self.threshold) * self.temp
+        mask = torch.sigmoid(diff)
+        
+        # 缓存 Mask 用于可视化分析 (Detach 防止影响梯度)
+        if not self.training:
+            self.last_mask = mask.detach()
+        
+        # 残差增强
+        out = x + (x * mask * self.enhance_weight)
+        
+        return out
+
+    def update_temperature(self, new_temp):
+        """在训练过程中调用此函数可实现退火策略"""
+        self.temp = new_temp
+
+class TriScaleLearnableFusion(nn.Module):
+    def __init__(self, channels=64, out_channels=128):
+        super(TriScaleLearnableFusion, self).__init__()
+        
+        # 1. 稀疏增强 (清洗)
+        self.enhance_s = LearnableResidualSparseBlock(channels, init_ratio=0.7) # Small/Deep
+        self.enhance_m = LearnableResidualSparseBlock(channels, init_ratio=0.6) # Mid
+        self.enhance_l = LearnableResidualSparseBlock(channels, init_ratio=0.5) # Large/Shallow
+        
+        # 2. 交互对齐层 (新增)
+        self.conv_align_s2m = BasicConv2d(channels, channels, 3, padding=1)
+        self.conv_align_m2l = BasicConv2d(channels, channels, 3, padding=1)
+        
+        # 3. 融合层
+        self.fusion_conv = nn.Sequential(
+            BasicConv2d(channels * 3, out_channels, 3, padding=1),
+            nn.Conv2d(out_channels, out_channels, kernel_size=1) 
+        )
+
+    def forward(self, x1, x2, x3):
+        # x1: Small (Deep), x2: Mid, x3: Large (Shallow)
+        
+        # Step 1: 稀疏清洗
+        x_s = self.enhance_s(x1)
+        x_m = self.enhance_m(x2)
+        x_l = self.enhance_l(x3)
+        
+        # Step 2: Top-Down 语义引导 (避免硬编码尺寸)
+        # Deep (Small) 指导 Mid
+        target_size_m = x_m.shape[2:] 
+        x_s_up = F.interpolate(x_s, size=target_size_m, mode='bilinear', align_corners=True)
+        x_m_gated = x_m * self.conv_align_s2m(x_s_up) # 乘法交互
+        
+        # Mid 指导 Large
+        target_size_l = x_l.shape[2:]
+        x_m_up = F.interpolate(x_m_gated, size=target_size_l, mode='bilinear', align_corners=True)
+        x_l_gated = x_l * self.conv_align_m2l(x_m_up) # 乘法交互
+        
+        # Step 3: 最终融合
+        x_s_final = F.interpolate(x_s, size=target_size_l, mode='bilinear', align_corners=True)
+        x_m_final = x_m_up 
+        x_l_final = x_l_gated
+        
+        cat = torch.cat([x_s_final, x_m_final, x_l_final], dim=1)
+        return self.fusion_conv(cat)
+
+    # [新增] 统一更新内部三个稀疏块的温度    
+    def update_all_temperatures(self, new_temp):
+        self.enhance_s.update_temperature(new_temp)
+        self.enhance_m.update_temperature(new_temp)
+        self.enhance_l.update_temperature(new_temp)
+    # ========================================================================================================================

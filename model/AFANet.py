@@ -14,60 +14,12 @@ import clip
 from .base.feature import extract_feat_vgg, extract_feat_res
 from .base.correlation import Correlation
 from .learner import HPNLearner
-from model.afa_module import NeighborConnectionDecoder, BasicConv2d # Octave 被 DCN 替代，不需要了
+from model.afa_module import BasicConv2d, PlugAndPlayDCN, TriScaleLearnableFusion
 from generate_cam_voc import PASCAL_CLASSES
 from generate_cam_coco import COCO_CLASSES
 
 # ==========================================================================================
-# 1. [新增] 支持外部 Mask 注入的可变形卷积 DCNv2
-# ==========================================================================================
-class PlugAndPlayDCN(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, groups=1):
-        super(PlugAndPlayDCN, self).__init__()
-        self.kernel_size = kernel_size
-        self.stride = stride
-        self.padding = padding
-        self.groups = groups
-        
-        # 核心卷积权重
-        self.weight = nn.Parameter(torch.empty(out_channels, in_channels // groups, kernel_size, kernel_size))
-        self.bias = nn.Parameter(torch.empty(out_channels))
-        
-        # 预测 offset 和 mask (眼睛)
-        self.p_conv = nn.Conv2d(in_channels, 3 * kernel_size * kernel_size, 
-                                kernel_size=kernel_size, padding=padding, stride=stride)
-        
-        # 初始化：确保初始状态接近普通卷积
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.bias)
-        nn.init.zeros_(self.p_conv.weight)
-        nn.init.zeros_(self.p_conv.bias)
-
-    def forward(self, x, external_mask=None):
-        # 1. 预测 Offset 和 内部 Mask
-        out = self.p_conv(x)
-        o1, o2, mask = torch.chunk(out, 3, dim=1)
-        offset = torch.cat([o1, o2], dim=1)
-        
-        # DCN 自身学到的 Mask (0~1)
-        mask = torch.sigmoid(mask)
-        
-        # 2. [关键] 注入 CAM 外部掩码
-        if external_mask is not None:
-            # 确保 external_mask 和 x 的尺寸一致 (插值对齐)
-            if external_mask.shape[-2:] != x.shape[-2:]:
-                external_mask = F.interpolate(external_mask, size=x.shape[-2:], 
-                                              mode='bilinear', align_corners=True)
-            
-            # 广播机制：如果 CAM 说是背景(0)，则强制 DCN 也不关注该区域
-            mask = mask * external_mask 
-        
-        return deform_conv2d(x, offset, self.weight, self.bias, 
-                             stride=self.stride, padding=self.padding, 
-                             mask=mask)
-
-# ==========================================================================================
-# 2. [新增] CoOp Prompt Learner (修复了 device 和硬编码问题)
+#  [新增] CoOp Prompt Learner (修复了 device 和硬编码问题)
 # ==========================================================================================
 class PromptLearner(nn.Module):
     def __init__(self, classnames, clip_model, n_ctx=16):
@@ -129,7 +81,7 @@ class PromptLearner(nn.Module):
         return text_features
 
 # ==========================================================================================
-# 3. AFANet 主模型
+# 2. AFANet 主模型
 # ==========================================================================================
 class afanet(nn.Module):
 
@@ -196,7 +148,7 @@ class afanet(nn.Module):
              self.fam_mid = PlugAndPlayDCN(1024, 64)
              self.fam_hig = PlugAndPlayDCN(2048, 64)
 
-        self.ncd = NeighborConnectionDecoder()
+        self.tsl = TriScaleLearnableFusion()
 
         self.state = nn.Parameter(torch.zeros([1, 128, 50, 50]))
         self.convz0 = nn.Conv2d(769, 512, kernel_size=1, padding=0)
@@ -305,9 +257,9 @@ class afanet(nn.Module):
             query_fam_mid = self.fam_mid(query_mid, external_mask=q_cam_mask)
             query_fam_hig = self.fam_hig(query_hig, external_mask=q_cam_mask)
         
-        # 5. Neighbor Connection Decoder (NCD)
-        support_ncd_feats = self.ncd(support_fam_low, support_fam_mid, support_fam_hig)
-        query_ncd_feats = self.ncd(query_fam_low, query_fam_mid, query_fam_hig)
+        # 5. tsl
+        support_ncd_feats = self.tsl(support_fam_hig, support_fam_mid, support_fam_low)
+        query_ncd_feats = self.tsl(query_fam_hig, query_fam_mid, query_fam_low)
 
         support_ncd_feats = self.bn(support_ncd_feats)
         support_ncd_feats = self.relu(support_ncd_feats)
@@ -494,3 +446,24 @@ class afanet(nn.Module):
     def train_mode(self):
         self.train()
         self.backbone.eval()  # to prevent BN from learning data statistics with exponential averaging
+    
+    # [新增] 温度退火调度器
+    def adjust_temperature(self, current_epoch, total_epochs):
+        """
+        线性退火策略 (Linear Annealing):
+        从 start_temp 逐渐增加到 end_temp
+        """
+        start_temp = 1.0
+        end_temp = 5.0  # 或者 10.0，取决于你希望多"硬"
+        
+        # 计算当前温度
+        # 限制在 total_epochs * 0.8 时就达到最大值，给模型最后一些 epoch 稳定适应
+        anneal_steps = total_epochs * 0.8
+        progress = min(1.0, current_epoch / anneal_steps)
+        
+        new_temp = start_temp + (end_temp - start_temp) * progress
+        
+        # 调用 TSL 模块进行更新
+        self.tsl.update_all_temperatures(new_temp)
+        
+        return new_temp # 返回以便打印日志
