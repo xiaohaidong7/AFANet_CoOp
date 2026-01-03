@@ -75,21 +75,40 @@ class Logger:
     r""" Writes evaluation results of training/testing """
     @classmethod
     def initialize(cls, args, training):
-        logtime = datetime.datetime.now().__format__('_%m%d_%H%M%S')
-        logpath = args.logpath if training else '_TEST_' + args.load.split('/')[-2].split('.')[0] + logtime
-        if logpath == '':
-            logpath = logtime
+        # [关键修改] 必须先定义日期，否则训练模式下无法读取到 date_str
+        date_str = datetime.datetime.now().__format__('%m%d')
 
-        # =========================================================
-        # [Fix] Change the hardcoded /opt/ path to local ./logs
-        # =========================================================
-        # 获取当前运行目录，并在其下创建 logs 文件夹
-        cls.logpath = os.path.join('./logs', logpath + '.log') 
+        # 1. 确定父目录和子文件夹名称
+        if training:
+            # =========== [训练模式] ===========
+            # 根据数据集区分父目录: ./logs/TRAIN/VOC 或 ./logs/TRAIN/COCO
+            parent_dir = './logs/TRAIN/VOC' if args.benchmark == 'pascal' else './logs/TRAIN/COCO'
+            
+            # 如果命令行未指定 --logpath，默认按照格式命名
+            if args.logpath == '':
+                # 格式: pascal_resnet50_fold1_1227
+                folder_name = f'{args.benchmark}_{args.backbone}_fold{args.fold}_{date_str}'
+            else:
+                folder_name = args.logpath
+                
+        else:
+            # =========== [测试/验证模式] ===========
+            # 根据数据集区分父目录: ./logs/TEST/VOC 或 ./logs/TEST/COCO
+            parent_dir = './logs/TEST/VOC' if args.benchmark == 'pascal' else './logs/TEST/COCO'
+            
+            # 格式: 1shot_pascal_resnet50_fold1_1227
+            folder_name = f'{args.nshot}shot_{args.benchmark}_{args.backbone}_fold{args.fold}_{date_str}'
+
+        # 2. 拼接生成完整的路径
+        # 例如: ./logs/TEST/VOC/1shot_pascal_resnet50_fold1_1227
+        cls.logpath = os.path.join(parent_dir, folder_name)
+        
         cls.benchmark = args.benchmark
         
-        # [Fix] Added exist_ok=True to avoid error if folder exists
+        # 3. 递归创建文件夹
         os.makedirs(cls.logpath, exist_ok=True)
 
+        # 4. 配置日志文件 (log.txt)
         logging.basicConfig(filemode='w',
                             filename=os.path.join(cls.logpath, 'log.txt'),
                             level=logging.INFO,

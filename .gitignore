@@ -2,6 +2,7 @@
 *.pth
 vis_results/
 logs/
+assets/
 
 .DS_Store
 .vscode/
